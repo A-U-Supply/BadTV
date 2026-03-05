@@ -1,21 +1,13 @@
 use anyhow::Result;
 use clap::Parser;
 
-#[allow(dead_code)]
 mod align;
-#[allow(dead_code)]
 mod audio;
-#[allow(dead_code)]
 mod fallback;
-#[allow(dead_code)]
 mod fetch;
-#[allow(dead_code)]
 mod model;
-#[allow(dead_code)]
 mod process;
-#[allow(dead_code)]
 mod search;
-#[allow(dead_code)]
 mod tui;
 
 /// Stitch TV news clips into infomercial-style audio collages
@@ -86,10 +78,173 @@ struct Cli {
     raw: bool,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
-    println!("Phrase: {}", cli.phrase);
-    println!("Output: {}", cli.output);
+    let client = reqwest::Client::new();
+
+    // Handle --download-model
+    let model_path = model::resolve_model_path(&cli.model)?;
+    if cli.download_model {
+        model::download_model(&client, &model_path).await?;
+    }
+
+    // Validate model exists
+    model::ensure_model_exists(&model_path)?;
+
+    let words: Vec<&str> = cli.phrase.split_whitespace().collect();
+    if words.is_empty() {
+        anyhow::bail!("Phrase cannot be empty");
+    }
+
+    eprintln!("Searching TV archive for {} words...\n", words.len());
+
+    let base_url = "https://api.gdeltproject.org/api/v2/tv/tv";
+    let mut word_clips: Vec<audio::AudioBuffer> = Vec::new();
+
+    for (i, &word) in words.iter().enumerate() {
+        eprintln!("  Searching for \"{}\"...", word);
+
+        // Search for clips
+        let clips = search::search_word(&client, word, &cli.station, &cli.exclude, base_url)
+            .await
+            .unwrap_or_default();
+
+        // Select a clip (TUI or random)
+        let selected_clip = if cli.no_tui || clips.is_empty() {
+            use rand::seq::IndexedRandom;
+            clips.choose(&mut rand::rng()).cloned()
+        } else {
+            match tui::select_clip(word, &clips, i, words.len())? {
+                tui::ClipChoice::Selected(c) => Some(c),
+                tui::ClipChoice::Random => {
+                    use rand::seq::IndexedRandom;
+                    clips.choose(&mut rand::rng()).cloned()
+                }
+                tui::ClipChoice::Quit => {
+                    eprintln!("\nAborted.");
+                    return Ok(());
+                }
+            }
+        };
+
+        let word_audio = if let Some(clip) = selected_clip {
+            let (start, end) = clip.time_range().unwrap_or((0.0_f64, 30.0_f64));
+            eprintln!("  Fetching audio from {}...", clip.show);
+            match fetch::fetch_audio_segment(&client, &clip.mp3_url(), start, end, 5.0).await {
+                Ok(segment) => {
+                    eprintln!("  Running whisper alignment...");
+                    match align::align_words(&segment, &model_path) {
+                        Ok(aligned) => {
+                            match align::extract_word(&segment, &aligned, word, 20.0) {
+                                Ok(extracted) => {
+                                    eprintln!(
+                                        "  Extracted \"{}\" [{:.2}s]",
+                                        word,
+                                        extracted.duration()
+                                    );
+                                    Some(extracted)
+                                }
+                                Err(e) => {
+                                    eprintln!("  Word extraction failed: {}", e);
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  Whisper alignment failed: {}", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Audio fetch failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            eprintln!("  No clips found for \"{}\"", word);
+            None
+        };
+
+        // Fallback chain
+        let final_audio = match word_audio {
+            Some(a) => a,
+            None => {
+                eprintln!("  Trying variations for \"{}\"...", word);
+                let mut found = None;
+                for variant in fallback::word_variations(word) {
+                    if variant == word {
+                        continue; // already tried
+                    }
+                    let var_clips = search::search_word(
+                        &client, &variant, &cli.station, &cli.exclude, base_url,
+                    )
+                    .await
+                    .unwrap_or_default();
+
+                    if let Some(clip) = {
+                        use rand::seq::IndexedRandom;
+                        var_clips.choose(&mut rand::rng()).cloned()
+                    } {
+                        let (start, end) = clip.time_range().unwrap_or((0.0_f64, 30.0_f64));
+                        if let Ok(segment) = fetch::fetch_audio_segment(
+                            &client,
+                            &clip.mp3_url(),
+                            start,
+                            end,
+                            5.0,
+                        )
+                        .await
+                        {
+                            if let Ok(aligned) = align::align_words(&segment, &model_path) {
+                                if let Ok(extracted) =
+                                    align::extract_word(&segment, &aligned, &variant, 20.0)
+                                {
+                                    eprintln!("  Found via variation \"{}\"", variant);
+                                    found = Some(extracted);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                match found {
+                    Some(a) => a,
+                    None => {
+                        eprintln!("  Falling back to TTS for \"{}\"", word);
+                        fallback::tts_word(word)?
+                    }
+                }
+            }
+        };
+
+        word_clips.push(final_audio);
+    }
+
+    eprintln!("\nAssembling output...");
+
+    // Apply processing pipeline (or raw stitch)
+    let output = if cli.raw {
+        process::crossfade::stitch(&word_clips, cli.crossfade, cli.gap)
+    } else {
+        let params = process::ProcessParams {
+            loudness_lufs: cli.loudness,
+            pitch_semitones: cli.pitch,
+            eq_preset: cli.eq.clone(),
+            compress_ratio: cli.compress,
+            crossfade_ms: cli.crossfade,
+            gap_ms: cli.gap,
+            reverb_wet: cli.reverb,
+            limit_db: cli.limit,
+        };
+        process::apply_pipeline(&word_clips, &params)
+    };
+
+    output.write_wav(&cli.output)?;
+    eprintln!("Wrote {} ({:.1}s)", cli.output, output.duration());
+
     Ok(())
 }
 

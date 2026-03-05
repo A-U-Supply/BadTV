@@ -21,6 +21,7 @@ impl AudioBuffer {
     }
 
     /// Create a silent buffer of a given duration.
+    #[allow(dead_code)] // useful utility, used in tests
     pub fn silence(duration_secs: f32, sample_rate: u32) -> Self {
         let num_samples = (duration_secs * sample_rate as f32) as usize;
         Self {

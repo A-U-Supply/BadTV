@@ -11,6 +11,7 @@ pub struct Clip {
     pub preview_url: String,
     pub ia_show_id: String,
     pub date: String,
+    #[allow(dead_code)] // deserialized from API, used for display
     pub station: String,
     pub show: String,
     pub snippet: String,
