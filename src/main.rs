@@ -4,6 +4,8 @@ use clap::Parser;
 #[allow(dead_code)]
 mod audio;
 #[allow(dead_code)]
+mod fetch;
+#[allow(dead_code)]
 mod search;
 
 /// Stitch TV news clips into infomercial-style audio collages
