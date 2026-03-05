@@ -10,6 +10,8 @@ mod fetch;
 #[allow(dead_code)]
 mod model;
 #[allow(dead_code)]
+mod process;
+#[allow(dead_code)]
 mod search;
 
 /// Stitch TV news clips into infomercial-style audio collages
