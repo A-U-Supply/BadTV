@@ -6,6 +6,8 @@ mod align;
 #[allow(dead_code)]
 mod audio;
 #[allow(dead_code)]
+mod fallback;
+#[allow(dead_code)]
 mod fetch;
 #[allow(dead_code)]
 mod model;
@@ -13,6 +15,8 @@ mod model;
 mod process;
 #[allow(dead_code)]
 mod search;
+#[allow(dead_code)]
+mod tui;
 
 /// Stitch TV news clips into infomercial-style audio collages
 #[derive(Parser, Debug)]
