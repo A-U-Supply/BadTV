@@ -2,9 +2,13 @@ use anyhow::Result;
 use clap::Parser;
 
 #[allow(dead_code)]
+mod align;
+#[allow(dead_code)]
 mod audio;
 #[allow(dead_code)]
 mod fetch;
+#[allow(dead_code)]
+mod model;
 #[allow(dead_code)]
 mod search;
 
