@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 
+#[allow(dead_code)]
+mod audio;
+
 /// Stitch TV news clips into infomercial-style audio collages
 #[derive(Parser, Debug)]
 #[command(name = "badtv", version, about)]
