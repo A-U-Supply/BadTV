@@ -30,12 +30,31 @@ impl AudioBuffer {
         }
     }
 
-    /// Extract a sub-range by time (seconds).
+    /// Extract a sub-range by time (seconds) with half-sine fade at edges
+    /// to prevent clicks/pops.
     pub fn slice(&self, start_secs: f32, end_secs: f32) -> Self {
         let start = (start_secs * self.sample_rate as f32) as usize;
         let end = (end_secs * self.sample_rate as f32).min(self.samples.len() as f32) as usize;
+        let mut samples = self.samples[start..end].to_vec();
+
+        // 3ms half-sine fade in/out (matches glottisdale approach)
+        let fade_samples = (0.003 * self.sample_rate as f32) as usize;
+        if samples.len() > fade_samples * 2 {
+            for (i, sample) in samples[..fade_samples].iter_mut().enumerate() {
+                let t = i as f32 / fade_samples as f32;
+                let gain = (t * std::f32::consts::FRAC_PI_2).sin();
+                *sample *= gain;
+            }
+            let len = samples.len();
+            for (i, sample) in samples[len - fade_samples..].iter_mut().enumerate() {
+                let t = i as f32 / fade_samples as f32;
+                let gain = ((1.0 - t) * std::f32::consts::FRAC_PI_2).sin();
+                *sample *= gain;
+            }
+        }
+
         Self {
-            samples: self.samples[start..end].to_vec(),
+            samples,
             sample_rate: self.sample_rate,
         }
     }

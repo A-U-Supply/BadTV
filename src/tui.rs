@@ -86,13 +86,11 @@ fn run_selection_loop(
                 .iter()
                 .enumerate()
                 .map(|(i, clip)| {
-                    let date_end = 10.min(clip.date.len());
                     let content = format!(
-                        " {}. {} ({}) \"{}\"",
+                        " {}. {} [{}]",
                         i + 1,
                         clip.show,
-                        &clip.date[..date_end],
-                        highlight_word(&clip.snippet, word)
+                        clip.station,
                     );
                     ListItem::new(content)
                 })
@@ -139,33 +137,3 @@ fn run_selection_loop(
     }
 }
 
-fn highlight_word(snippet: &str, word: &str) -> String {
-    let lower_snippet = snippet.to_lowercase();
-    let lower_word = word.to_lowercase();
-    if let Some(pos) = lower_snippet.find(&lower_word) {
-        let before = &snippet[..pos];
-        let matched = &snippet[pos..pos + word.len()];
-        let after = &snippet[pos + word.len()..];
-        format!("{}{}{}", before, matched.to_uppercase(), after)
-    } else {
-        snippet.to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_highlight_word() {
-        assert_eq!(
-            highlight_word("we must act on this", "act"),
-            "we must ACT on this"
-        );
-    }
-
-    #[test]
-    fn test_highlight_not_found() {
-        assert_eq!(highlight_word("hello world", "missing"), "hello world");
-    }
-}

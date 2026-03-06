@@ -1,10 +1,45 @@
 use crate::audio::AudioBuffer;
 
+/// Resample an AudioBuffer to the target sample rate if needed.
+fn resample_to(buf: &AudioBuffer, target_sr: u32) -> AudioBuffer {
+    if buf.sample_rate == target_sr {
+        return buf.clone();
+    }
+    use rubato::{FftFixedIn, Resampler};
+    let chunk_size = 1024;
+    let mut resampler = FftFixedIn::<f32>::new(
+        buf.sample_rate as usize,
+        target_sr as usize,
+        chunk_size,
+        1,
+        1,
+    )
+    .expect("Failed to create resampler");
+
+    let mut output = Vec::new();
+    for chunk in buf.samples.chunks(chunk_size) {
+        let mut input_chunk = chunk.to_vec();
+        if input_chunk.len() < chunk_size {
+            input_chunk.resize(chunk_size, 0.0);
+        }
+        let result = resampler
+            .process(&[input_chunk], None)
+            .expect("Resampling failed");
+        output.extend_from_slice(&result[0]);
+    }
+    // Trim to expected length
+    let expected = (buf.samples.len() as f64 * target_sr as f64 / buf.sample_rate as f64) as usize;
+    output.truncate(expected);
+    AudioBuffer::new(output, target_sr)
+}
+
 pub fn stitch(clips: &[AudioBuffer], crossfade_ms: u32, gap_ms: u32) -> AudioBuffer {
     if clips.is_empty() {
         return AudioBuffer::new(vec![], 44100);
     }
-    let sr = clips[0].sample_rate;
+    // Resample all clips to 44100 for consistent output.
+    let sr = 44100u32;
+    let clips: Vec<AudioBuffer> = clips.iter().map(|c| resample_to(c, sr)).collect();
     let xfade = (crossfade_ms as f32 / 1000.0 * sr as f32) as usize;
     let gap = (gap_ms as f32 / 1000.0 * sr as f32) as usize;
     let mut out: Vec<f32> = Vec::new();

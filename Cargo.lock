@@ -131,6 +131,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "futures",
  "hound",
  "indicatif",
  "pitch_shift",
@@ -147,6 +148,7 @@ dependencies = [
  "tts",
  "urlencoding",
  "whisper-rs",
+ "whisper-rs-sys",
  "wiremock",
 ]
 
