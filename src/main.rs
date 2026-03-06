@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 mod align;
 mod audio;
@@ -14,13 +14,21 @@ mod tui;
 #[derive(Parser, Debug)]
 #[command(name = "badtv", version, about)]
 struct Cli {
-    /// The phrase to construct from TV clips
-    phrase: String,
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Output file path
-    #[arg(short, long, default_value = "badtv_output.wav")]
-    output: String,
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Stitch a phrase from TV news clips
+    Stitch(StitchArgs),
+    /// Download multiple isolated samples of a single word
+    Sample(SampleArgs),
+}
 
+/// Shared options for model and station filtering.
+#[derive(Parser, Debug, Clone)]
+struct SharedArgs {
     /// Filter to specific stations (repeatable)
     #[arg(long)]
     station: Vec<String>,
@@ -29,10 +37,6 @@ struct Cli {
     #[arg(long)]
     exclude: Vec<String>,
 
-    /// Skip interactive selection, pick randomly
-    #[arg(long)]
-    no_tui: bool,
-
     /// Path to whisper model file
     #[arg(long, default_value = "~/.badtv/ggml-base.en.bin")]
     model: String,
@@ -40,9 +44,26 @@ struct Cli {
     /// Download the whisper model if not present
     #[arg(long)]
     download_model: bool,
+}
+
+#[derive(Parser, Debug)]
+struct StitchArgs {
+    /// The phrase to construct from TV clips
+    phrase: String,
+
+    /// Output file path
+    #[arg(short, long, default_value = "badtv_output.wav")]
+    output: String,
+
+    #[command(flatten)]
+    shared: SharedArgs,
+
+    /// Interactively select clips (default: pick randomly)
+    #[arg(long, short)]
+    interactive: bool,
 
     /// Pitch shift in semitones
-    #[arg(long, default_value = "2.0")]
+    #[arg(long, default_value = "0.0")]
     pitch: f32,
 
     /// Target loudness in LUFS
@@ -54,19 +75,19 @@ struct Cli {
     crossfade: u32,
 
     /// Gap between words in milliseconds
-    #[arg(long, default_value = "50")]
+    #[arg(long, default_value = "120")]
     gap: u32,
 
     /// Reverb wet mix (0-100)
-    #[arg(long, default_value = "15")]
+    #[arg(long, default_value = "0")]
     reverb: u32,
 
     /// Compressor ratio
-    #[arg(long, default_value = "4.0")]
+    #[arg(long, default_value = "2.0")]
     compress: f32,
 
     /// EQ preset: tv, bright, flat, off
-    #[arg(long, default_value = "tv")]
+    #[arg(long, default_value = "flat")]
     eq: String,
 
     /// Limiter ceiling in dB
@@ -76,156 +97,179 @@ struct Cli {
     /// Skip all audio processing, just stitch
     #[arg(long)]
     raw: bool,
+
+    /// Transcribe final output with whisper to verify intelligibility
+    #[arg(long)]
+    verify: bool,
+}
+
+#[derive(Parser, Debug)]
+struct SampleArgs {
+    /// The word to download samples of
+    word: String,
+
+    /// Number of samples to collect
+    #[arg(short = 'n', long, default_value = "5")]
+    count: usize,
+
+    /// Output directory (default: ./{word}/)
+    #[arg(short, long)]
+    output_dir: Option<String>,
+
+    #[command(flatten)]
+    shared: SharedArgs,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Stitch(args) => run_stitch(args).await,
+        Commands::Sample(args) => run_sample(args).await,
+    }
+}
+
+async fn run_stitch(cli: StitchArgs) -> Result<()> {
     let client = reqwest::Client::new();
 
-    // Handle --download-model
-    let model_path = model::resolve_model_path(&cli.model)?;
-    if cli.download_model {
+    let model_path = model::resolve_model_path(&cli.shared.model)?;
+    if cli.shared.download_model {
         model::download_model(&client, &model_path).await?;
     }
-
-    // Validate model exists
     model::ensure_model_exists(&model_path)?;
 
-    let words: Vec<&str> = cli.phrase.split_whitespace().collect();
+    let whisper_ctx = align::load_whisper_context(&model_path)?;
+
+    let words: Vec<String> = cli
+        .phrase
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|w| !w.is_empty())
+        .collect();
     if words.is_empty() {
         anyhow::bail!("Phrase cannot be empty");
     }
 
-    eprintln!("Searching TV archive for {} words...\n", words.len());
-
-    let base_url = "https://api.gdeltproject.org/api/v2/tv/tv";
+    let base_url = "https://archive.org/services/search/beta/page_production/";
     let mut word_clips: Vec<audio::AudioBuffer> = Vec::new();
 
-    for (i, &word) in words.iter().enumerate() {
-        eprintln!("  Searching for \"{}\"...", word);
+    let mut search_cache: std::collections::HashMap<String, Vec<search::Clip>> =
+        std::collections::HashMap::new();
+    let mut used_identifiers: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
-        // Search for clips
-        let clips = search::search_word(&client, word, &cli.station, &cli.exclude, base_url)
+    for (i, word) in words.iter().enumerate() {
+        eprint!("[{}/{}] \"{}\"", i + 1, words.len(), word);
+
+        let clips = if let Some(cached) = search_cache.get(word) {
+            cached.clone()
+        } else {
+            let results = search::search_word(
+                &client,
+                word,
+                &cli.shared.station,
+                &cli.shared.exclude,
+                base_url,
+            )
             .await
             .unwrap_or_default();
+            let available = search::filter_available_clips(&client, &results).await;
+            eprint!(" ({}/{})", available.len(), results.len());
+            search_cache.insert(word.clone(), available.clone());
+            available
+        };
 
-        // Select a clip (TUI or random)
-        let selected_clip = if cli.no_tui || clips.is_empty() {
-            use rand::seq::IndexedRandom;
-            clips.choose(&mut rand::rng()).cloned()
-        } else {
+        let selected_clip = if cli.interactive && !clips.is_empty() {
             match tui::select_clip(word, &clips, i, words.len())? {
-                tui::ClipChoice::Selected(c) => Some(c),
-                tui::ClipChoice::Random => {
-                    use rand::seq::IndexedRandom;
-                    clips.choose(&mut rand::rng()).cloned()
-                }
                 tui::ClipChoice::Quit => {
                     eprintln!("\nAborted.");
                     return Ok(());
                 }
-            }
-        };
-
-        let word_audio = if let Some(clip) = selected_clip {
-            let (start, end) = clip.time_range().unwrap_or((0.0_f64, 30.0_f64));
-            eprintln!("  Fetching audio from {}...", clip.show);
-            match fetch::fetch_audio_segment(&client, &clip.mp3_url(), start, end, 5.0).await {
-                Ok(segment) => {
-                    eprintln!("  Running whisper alignment...");
-                    match align::align_words(&segment, &model_path) {
-                        Ok(aligned) => {
-                            match align::extract_word(&segment, &aligned, word, 20.0) {
-                                Ok(extracted) => {
-                                    eprintln!(
-                                        "  Extracted \"{}\" [{:.2}s]",
-                                        word,
-                                        extracted.duration()
-                                    );
-                                    Some(extracted)
-                                }
-                                Err(e) => {
-                                    eprintln!("  Word extraction failed: {}", e);
-                                    None
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("  Whisper alignment failed: {}", e);
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  Audio fetch failed: {}", e);
-                    None
-                }
+                tui::ClipChoice::Selected(clip) => Some(clip),
+                tui::ClipChoice::Random => None,
             }
         } else {
-            eprintln!("  No clips found for \"{}\"", word);
             None
         };
 
-        // Fallback chain
-        let final_audio = match word_audio {
-            Some(a) => a,
+        let sorted_clips = if let Some(ref picked) = selected_clip {
+            let mut v = vec![picked.clone()];
+            v.extend(
+                clips
+                    .iter()
+                    .filter(|c| c.identifier != picked.identifier)
+                    .cloned(),
+            );
+            v
+        } else {
+            let mut v = clips.clone();
+            v.sort_by(|a, b| {
+                let a_used = used_identifiers.contains(&a.identifier) as u8;
+                let b_used = used_identifiers.contains(&b.identifier) as u8;
+                a_used.cmp(&b_used).then(
+                    a.start_secs
+                        .partial_cmp(&b.start_secs)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+            });
+            v
+        };
+
+        let mut verified = None;
+        'clip_loop: for clip in &sorted_clips {
+            let caption_hits = match search::find_word_in_srt(&client, clip, word).await {
+                Ok(hits) if !hits.is_empty() => {
+                    eprint!(" [{}:{}hits]", clip.station, hits.len());
+                    hits
+                }
+                _ => continue,
+            };
+
+            for hit in &caption_hits {
+                let segment = match fetch::fetch_audio_segment(
+                    &client,
+                    &clip.mp3_url(),
+                    hit.start_secs,
+                    hit.end_secs,
+                    10.0,
+                )
+                .await
+                {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                let aligned = match align::align_words_python(&segment) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+
+                let extracted = match align::extract_word(&segment, &aligned, word, 0.0) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                used_identifiers.insert(clip.identifier.clone());
+                verified = Some(extracted);
+                break 'clip_loop;
+            }
+        }
+
+        let final_audio = match verified {
+            Some(a) => {
+                eprintln!(" ok [{:.2}s]", a.duration());
+                a
+            }
             None => {
-                eprintln!("  Trying variations for \"{}\"...", word);
-                let mut found = None;
-                for variant in fallback::word_variations(word) {
-                    if variant == word {
-                        continue; // already tried
-                    }
-                    let var_clips = search::search_word(
-                        &client, &variant, &cli.station, &cli.exclude, base_url,
-                    )
-                    .await
-                    .unwrap_or_default();
-
-                    if let Some(clip) = {
-                        use rand::seq::IndexedRandom;
-                        var_clips.choose(&mut rand::rng()).cloned()
-                    } {
-                        let (start, end) = clip.time_range().unwrap_or((0.0_f64, 30.0_f64));
-                        if let Ok(segment) = fetch::fetch_audio_segment(
-                            &client,
-                            &clip.mp3_url(),
-                            start,
-                            end,
-                            5.0,
-                        )
-                        .await
-                        {
-                            if let Ok(aligned) = align::align_words(&segment, &model_path) {
-                                if let Ok(extracted) =
-                                    align::extract_word(&segment, &aligned, &variant, 20.0)
-                                {
-                                    eprintln!("  Found via variation \"{}\"", variant);
-                                    found = Some(extracted);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                match found {
-                    Some(a) => a,
-                    None => {
-                        eprintln!("  Falling back to TTS for \"{}\"", word);
-                        fallback::tts_word(word)?
-                    }
-                }
+                eprintln!(" tts");
+                fallback::tts_word(word)?
             }
         };
 
         word_clips.push(final_audio);
     }
 
-    eprintln!("\nAssembling output...");
-
-    // Apply processing pipeline (or raw stitch)
     let output = if cli.raw {
         process::crossfade::stitch(&word_clips, cli.crossfade, cli.gap)
     } else {
@@ -245,42 +289,207 @@ async fn main() -> Result<()> {
     output.write_wav(&cli.output)?;
     eprintln!("Wrote {} ({:.1}s)", cli.output, output.duration());
 
+    if cli.verify {
+        match align::transcribe(&output, &whisper_ctx) {
+            Ok(heard) => eprintln!("Whisper heard: \"{}\"", heard),
+            Err(e) => eprintln!("Verification failed: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_sample(args: SampleArgs) -> Result<()> {
+    let client = reqwest::Client::new();
+
+    let model_path = model::resolve_model_path(&args.shared.model)?;
+    if args.shared.download_model {
+        model::download_model(&client, &model_path).await?;
+    }
+    model::ensure_model_exists(&model_path)?;
+
+    let word = args
+        .word
+        .trim()
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    if word.is_empty() {
+        anyhow::bail!("Word cannot be empty");
+    }
+
+    let out_dir = args.output_dir.unwrap_or_else(|| word.clone());
+    std::fs::create_dir_all(&out_dir)?;
+
+    eprintln!(
+        "Sampling \"{}\" (target: {} clips) -> {}/",
+        word, args.count, out_dir
+    );
+
+    let base_url = "https://archive.org/services/search/beta/page_production/";
+    let results = search::search_word(
+        &client,
+        &word,
+        &args.shared.station,
+        &args.shared.exclude,
+        base_url,
+    )
+    .await?;
+    let clips = search::filter_available_clips(&client, &results).await;
+    eprintln!(
+        "Found {} available clips (of {} search results)",
+        clips.len(),
+        results.len()
+    );
+
+    if clips.is_empty() {
+        anyhow::bail!("No clips found for \"{}\"", word);
+    }
+
+    let mut collected = 0usize;
+
+    for clip in &clips {
+        if collected >= args.count {
+            break;
+        }
+
+        eprint!("  [{}] {}", clip.station, clip.identifier);
+
+        let caption_hits = match search::find_word_in_srt(&client, clip, &word).await {
+            Ok(hits) if !hits.is_empty() => {
+                eprint!(" ({}hits)", hits.len());
+                hits
+            }
+            _ => {
+                eprintln!(" skip (no SRT match)");
+                continue;
+            }
+        };
+
+        for hit in &caption_hits {
+            if collected >= args.count {
+                break;
+            }
+
+            let segment = match fetch::fetch_audio_segment(
+                &client,
+                &clip.mp3_url(),
+                hit.start_secs,
+                hit.end_secs,
+                10.0,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let aligned = match align::align_words_python(&segment) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+
+            let extracted = match align::extract_word(&segment, &aligned, &word, 0.0) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let filename = format!("{}/{}-{}.wav", out_dir, word, clip.identifier);
+            extracted.write_wav(&filename)?;
+            collected += 1;
+            eprintln!(" ok [{:.2}s] -> {}", extracted.duration(), filename);
+            break; // one sample per clip for variety
+        }
+    }
+
+    eprintln!(
+        "\nCollected {}/{} samples in {}/",
+        collected, args.count, out_dir
+    );
+
+    if collected == 0 {
+        anyhow::bail!(
+            "Failed to extract any samples for \"{}\" from {} clips",
+            word,
+            clips.len()
+        );
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
-    fn test_cli_defaults() {
-        let cli = Cli::parse_from(["badtv", "hello world"]);
-        assert_eq!(cli.phrase, "hello world");
-        assert_eq!(cli.output, "badtv_output.wav");
-        assert_eq!(cli.pitch, 2.0);
-        assert_eq!(cli.loudness, -16.0);
-        assert_eq!(cli.crossfade, 30);
-        assert_eq!(cli.gap, 50);
-        assert_eq!(cli.reverb, 15);
-        assert_eq!(cli.compress, 4.0);
-        assert_eq!(cli.eq, "tv");
-        assert_eq!(cli.limit, -1.0);
-        assert!(!cli.raw);
-        assert!(!cli.no_tui);
+    fn test_stitch_defaults() {
+        let cli = Cli::parse_from(["badtv", "stitch", "hello world"]);
+        match cli.command {
+            Commands::Stitch(args) => {
+                assert_eq!(args.phrase, "hello world");
+                assert_eq!(args.output, "badtv_output.wav");
+                assert_eq!(args.pitch, 0.0);
+                assert_eq!(args.loudness, -16.0);
+                assert_eq!(args.crossfade, 30);
+                assert_eq!(args.gap, 120);
+                assert_eq!(args.reverb, 0);
+                assert_eq!(args.compress, 2.0);
+                assert_eq!(args.eq, "flat");
+                assert_eq!(args.limit, -1.0);
+                assert!(!args.raw);
+                assert!(!args.interactive);
+            }
+            _ => panic!("Expected Stitch command"),
+        }
     }
 
     #[test]
-    fn test_cli_custom_flags() {
+    fn test_stitch_custom_flags() {
         let cli = Cli::parse_from([
-            "badtv", "buy now", "-o", "out.wav",
-            "--station", "CNN", "--station", "MSNBC",
-            "--pitch", "3.5", "--raw", "--no-tui",
+            "badtv", "stitch", "buy now", "-o", "out.wav", "--station", "CNN", "--station",
+            "MSNBC", "--pitch", "3.5", "--raw", "--interactive",
         ]);
-        assert_eq!(cli.phrase, "buy now");
-        assert_eq!(cli.output, "out.wav");
-        assert_eq!(cli.station, vec!["CNN", "MSNBC"]);
-        assert_eq!(cli.pitch, 3.5);
-        assert!(cli.raw);
-        assert!(cli.no_tui);
+        match cli.command {
+            Commands::Stitch(args) => {
+                assert_eq!(args.phrase, "buy now");
+                assert_eq!(args.output, "out.wav");
+                assert_eq!(args.shared.station, vec!["CNN", "MSNBC"]);
+                assert_eq!(args.pitch, 3.5);
+                assert!(args.raw);
+                assert!(args.interactive);
+            }
+            _ => panic!("Expected Stitch command"),
+        }
+    }
+
+    #[test]
+    fn test_sample_defaults() {
+        let cli = Cli::parse_from(["badtv", "sample", "buy"]);
+        match cli.command {
+            Commands::Sample(args) => {
+                assert_eq!(args.word, "buy");
+                assert_eq!(args.count, 5);
+                assert!(args.output_dir.is_none());
+                assert!(args.shared.station.is_empty());
+            }
+            _ => panic!("Expected Sample command"),
+        }
+    }
+
+    #[test]
+    fn test_sample_custom_flags() {
+        let cli = Cli::parse_from([
+            "badtv", "sample", "buy", "-n", "10", "-o", "samples", "--station", "CNN",
+        ]);
+        match cli.command {
+            Commands::Sample(args) => {
+                assert_eq!(args.word, "buy");
+                assert_eq!(args.count, 10);
+                assert_eq!(args.output_dir, Some("samples".to_string()));
+                assert_eq!(args.shared.station, vec!["CNN"]);
+            }
+            _ => panic!("Expected Sample command"),
+        }
     }
 }

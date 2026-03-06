@@ -24,12 +24,12 @@ impl Default for ProcessParams {
     fn default() -> Self {
         Self {
             loudness_lufs: -16.0,
-            pitch_semitones: 2.0,
-            eq_preset: "tv".to_string(),
-            compress_ratio: 4.0,
+            pitch_semitones: 0.0,
+            eq_preset: "flat".to_string(),
+            compress_ratio: 2.0,
             crossfade_ms: 30,
-            gap_ms: 50,
-            reverb_wet: 15,
+            gap_ms: 120,
+            reverb_wet: 0,
             limit_db: -1.0,
         }
     }
