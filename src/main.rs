@@ -116,6 +116,14 @@ struct SampleArgs {
     #[arg(short, long)]
     output_dir: Option<String>,
 
+    /// Also create a stitched compilation of all samples
+    #[arg(long)]
+    stitch: bool,
+
+    /// Gap between clips in stitched output (milliseconds)
+    #[arg(long, default_value = "200")]
+    gap: u32,
+
     #[command(flatten)]
     shared: SharedArgs,
 }
@@ -346,6 +354,7 @@ async fn run_sample(args: SampleArgs) -> Result<()> {
     }
 
     let mut collected = 0usize;
+    let mut samples: Vec<audio::AudioBuffer> = Vec::new();
 
     for clip in &clips {
         if collected >= args.count {
@@ -397,6 +406,7 @@ async fn run_sample(args: SampleArgs) -> Result<()> {
             extracted.write_wav(&filename)?;
             collected += 1;
             eprintln!(" ok [{:.2}s] -> {}", extracted.duration(), filename);
+            samples.push(extracted);
             break; // one sample per clip for variety
         }
     }
@@ -412,6 +422,13 @@ async fn run_sample(args: SampleArgs) -> Result<()> {
             word,
             clips.len()
         );
+    }
+
+    if args.stitch && samples.len() > 1 {
+        let stitched = process::crossfade::stitch(&samples, 0, args.gap);
+        let stitch_path = format!("{}/{}-stitched.wav", out_dir, word);
+        stitched.write_wav(&stitch_path)?;
+        eprintln!("Stitched {} clips -> {} ({:.1}s)", samples.len(), stitch_path, stitched.duration());
     }
 
     Ok(())
@@ -471,6 +488,8 @@ mod tests {
                 assert_eq!(args.word, "buy");
                 assert_eq!(args.count, 5);
                 assert!(args.output_dir.is_none());
+                assert!(!args.stitch);
+                assert_eq!(args.gap, 200);
                 assert!(args.shared.station.is_empty());
             }
             _ => panic!("Expected Sample command"),
@@ -481,6 +500,7 @@ mod tests {
     fn test_sample_custom_flags() {
         let cli = Cli::parse_from([
             "badtv", "sample", "buy", "-n", "10", "-o", "samples", "--station", "CNN",
+            "--stitch", "--gap", "300",
         ]);
         match cli.command {
             Commands::Sample(args) => {
@@ -488,6 +508,8 @@ mod tests {
                 assert_eq!(args.count, 10);
                 assert_eq!(args.output_dir, Some("samples".to_string()));
                 assert_eq!(args.shared.station, vec!["CNN"]);
+                assert!(args.stitch);
+                assert_eq!(args.gap, 300);
             }
             _ => panic!("Expected Sample command"),
         }
