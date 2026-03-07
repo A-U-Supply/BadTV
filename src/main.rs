@@ -94,6 +94,10 @@ struct StitchArgs {
     #[arg(long, default_value = "-1.0")]
     limit: f32,
 
+    /// Padding around each extracted word in milliseconds
+    #[arg(long, default_value = "0")]
+    padding: f32,
+
     /// Skip all audio processing, just stitch
     #[arg(long)]
     raw: bool,
@@ -119,6 +123,10 @@ struct SampleArgs {
     /// Also create a stitched compilation of all samples
     #[arg(long)]
     stitch: bool,
+
+    /// Padding around each extracted word in milliseconds
+    #[arg(long, default_value = "0")]
+    padding: f32,
 
     /// Gap between clips in stitched output (milliseconds)
     #[arg(long, default_value = "200")]
@@ -253,7 +261,7 @@ async fn run_stitch(cli: StitchArgs) -> Result<()> {
                     Err(_) => continue,
                 };
 
-                let extracted = match align::extract_word(&segment, &aligned, word, 0.0) {
+                let extracted = match align::extract_word(&segment, &aligned, word, cli.padding) {
                     Ok(e) => e,
                     Err(_) => continue,
                 };
@@ -397,7 +405,7 @@ async fn run_sample(args: SampleArgs) -> Result<()> {
                 Err(_) => continue,
             };
 
-            let extracted = match align::extract_word(&segment, &aligned, &word, 0.0) {
+            let extracted = match align::extract_word(&segment, &aligned, &word, args.padding) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
