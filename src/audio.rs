@@ -62,7 +62,7 @@ impl AudioBuffer {
     /// Write to WAV file.
     pub fn write_wav(&self, path: &str) -> Result<()> {
         let spec = hound::WavSpec {
-            channels: 1,
+            channels: 2,
             sample_rate: self.sample_rate,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
@@ -70,7 +70,8 @@ impl AudioBuffer {
         let mut writer =
             hound::WavWriter::create(path, spec).context("Failed to create WAV file")?;
         for &sample in &self.samples {
-            writer.write_sample(sample)?;
+            writer.write_sample(sample)?; // left
+            writer.write_sample(sample)?; // right
         }
         writer.finalize()?;
         Ok(())
@@ -81,7 +82,8 @@ impl AudioBuffer {
         let mut reader =
             hound::WavReader::open(path).context("Failed to open WAV file")?;
         let spec = reader.spec();
-        let samples: Vec<f32> = match spec.sample_format {
+        let channels = spec.channels as usize;
+        let all_samples: Vec<f32> = match spec.sample_format {
             hound::SampleFormat::Float => reader
                 .samples::<f32>()
                 .collect::<hound::Result<Vec<f32>>>()
@@ -96,6 +98,15 @@ impl AudioBuffer {
                     .map(|s| s as f32 / max)
                     .collect()
             }
+        };
+        // Downmix to mono if multi-channel.
+        let samples = if channels > 1 {
+            all_samples
+                .chunks(channels)
+                .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                .collect()
+        } else {
+            all_samples
         };
         Ok(Self {
             samples,
